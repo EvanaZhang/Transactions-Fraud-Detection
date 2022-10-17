@@ -1,0 +1,452 @@
+---
+title: "Project2__YifeiZhang"
+author: "Yifei_Zhang"
+date: "11/01/2021"
+output: html_document
+---
+# Library 
+```{r,message=FALSE,warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(ggplot2)
+library(corrplot)
+library(glmnet)
+library(rpart.plot)
+library(vip)   
+library(reshape2)
+library(dplyr)
+library(randomForest)
+library(parallel)  
+library(doParallel)
+library(caret)
+```
+
+# Load in Data
+```{r}
+fraud <- read_csv("project_2_training.csv") %>% clean_names()
+#kaggle <- read_csv("project_2_holdout.csv") %>% clean_names()
+fraud %>% head()
+#kaggle %>% select(-score)
+
+```
+
+# Skim Data Profiles 
+```{r}
+fraud %>% skim()
+#kaggle %>% skim()
+```
+
+# Remove Irrelevant/Meaningless Variables (both categorical & numeric)
+```{r}
+fraud_s <- fraud %>% 
+  select(-ip_address, -user_agent, -phone_number, #-billing_city, -email_domain,
+         -event_timestamp, -applicant_name, -billing_address, -merchant_id, 
+         -event_id, -locale) %>% 
+  mutate(event_label = ifelse(event_label == 'fraud', 1, 0))
+ 
+```
+
+# Target Variable
+```{r}
+fraud_s %>% 
+  count(event_label) %>% 
+  mutate(pct = n / sum(n)) -> fraud_default
+
+fraud_default
+
+fraud_default %>% 
+  ggplot(aes(x = event_label, y = pct)) + 
+  geom_col() +
+  geom_text(aes(label = pct) ,color = "red") + 
+  labs(title="Percentage of Fraud vs. Legit") 
+```
+# Frequency Encoding
+```{r}
+city_freq_count <- fraud_s %>% 
+  count(billing_city, sort = TRUE) %>% 
+  select(billing_city, billing_city_count = n) 
+
+city_freq_count %>% head()
+
+fraud_s <- fraud_s %>% 
+  left_join(city_freq_count) %>% 
+  select(-billing_city)
+```
+
+# Target Encoding
+```{r}
+domain_fraud_rate <- fraud %>% 
+  group_by(event_label, email_domain) %>% 
+  summarise(n = n()) %>% 
+  pivot_wider(names_from = event_label, values_from = n, values_fill = 0.0) %>% 
+  mutate(domain_pct_fraud = fraud / (fraud + legit)) %>% 
+  select(email_domain, domain_pct_fraud)
+
+domain_fraud_rate
+
+fraud_s <- fraud_s %>% 
+  left_join(domain_fraud_rate) %>% 
+  select(-email_domain)
+```
+# Correlation 
+```{r}
+fraud_s %>% 
+  select_if(is.numeric) %>% 
+  na.omit() %>% 
+  cor() %>% 
+  corrplot()
+
+```
+# Explore Numeric Variables Relationship
+```{r}
+fraud %>%
+  mutate(event_label = as_factor(event_label))
+
+num_explore <- function(col){
+  fraud %>%
+    ggplot(aes(x=event_label, y=!!as.name(col))) +
+    geom_boxplot() +
+    labs(title= as.name(col))
+}
+
+for (c in names(fraud %>% select_if (is_numeric))){
+  cht <- num_explore(c)
+  print(cht)
+}
+```
+
+# Explore relationships of different feature
+
+```{r}
+fraud_s %>% 
+  ggplot(aes(x = factor(currency))) +
+  geom_bar() +
+  coord_flip()
+
+fraud_s %>% 
+  ggplot(aes(x = factor(cvv))) +
+  geom_bar() +
+  coord_flip()
+
+fraud_s %>% 
+  ggplot(aes(x = factor(signature_image))) +
+  geom_bar() +
+  coord_flip()
+
+fraud_s %>% 
+  ggplot(aes(x = factor(transaction_type))) +
+  geom_bar() +
+  coord_flip()
+
+fraud_s %>% 
+  ggplot(aes(x = factor(transaction_env))) +
+  geom_bar() +
+  coord_flip()
+
+fraud_s %>% 
+  ggplot(aes(x = factor(tranaction_initiate))) +
+  geom_bar() +
+  coord_flip()
+```
+# Convert Factors
+```{r}
+fraud_prep <- fraud_s %>% 
+  mutate(event_label = as_factor(event_label)) %>% 
+  mutate_if(is.character, as_factor)
+```
+
+
+# Train/Test Split
+```{r}
+set.seed(123)
+
+train_test_split <- initial_split(fraud_prep, prop = 0.7, strata = event_label)
+
+train <- training(train_test_split)
+test <- testing(train_test_split)
+
+sprintf("Train Percent: %1.2f%%", nrow(train) / nrow(fraud_prep) * 100)
+sprintf("Test Percent: %1.2f%%", nrow(test) / nrow(fraud_prep) * 100)
+
+```
+
+# Recipe & Decision Tree Default
+```{r}
+fraud_recipe <- recipe(event_label ~ ., data = train) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_impute_mean(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) 
+
+logistic_spec <- logistic_reg() %>%
+  set_mode("classification") %>%
+  set_engine("glm")
+
+logistic_wf <- workflow() %>%
+  add_recipe(fraud_recipe) %>%
+  add_model(logistic_spec) %>%
+  fit(train)
+
+logistic_wf %>%
+  extract_fit_parsnip() %>%
+  tidy() %>%
+  mutate(across(is.numeric, round, 3))
+
+logistic_wf %>%
+  extract_fit_parsnip() %>%
+  vip()
+
+options(yardstick.event_first = FALSE)
+
+predict(logistic_wf, train, type="prob") %>%
+  bind_cols(predict(logistic_wf, train, type="class")) %>%
+  bind_cols(train) -> logistic_train
+
+logistic_train %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+
+predict(logistic_wf, test, type="prob") %>%
+  bind_cols(predict(logistic_wf, test, type="class")) %>%
+  bind_cols(test) -> logistic_test 
+
+logistic_test %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+
+# -- ROC Charts 
+logistic_train %>%
+  mutate(model = "train") %>%
+  bind_rows(logistic_test %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(event_label, .pred_1) %>%
+  autoplot()
+
+
+# -- Confusion Matrices
+logistic_train %>%
+  conf_mat(event_label, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title="Train Confusion Matrix")
+
+logistic_test %>%
+  conf_mat(event_label, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+```
+
+## Tree model
+
+```{r}
+tree_spec <- decision_tree(cost_complexity = 0.001) %>%
+  set_mode("classification") %>%
+  set_engine("rpart")
+
+tree_wf <- workflow() %>%
+  add_recipe(fraud_recipe) %>%
+  add_model(tree_spec) %>%
+  fit(train)
+
+tree_wf %>%
+  pull_workflow_fit() %>%
+  vip()
+
+# -- plot tree
+rpart.plot(tree_wf$fit$fit$fit)
+rpart.rules(tree_wf$fit$fit$fit)
+
+# -- deal w. the first event issue -- # 
+options(yardstick.event_first = FALSE)
+
+predict(tree_wf, train, type="prob") %>%
+  bind_cols(predict(tree_wf, train, type="class")) %>%
+  bind_cols(train) -> tree_train
+
+tree_train %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+
+predict(tree_wf, test, type="prob") %>%
+  bind_cols(predict(tree_wf, test, type="class")) %>%
+  bind_cols(test) -> tree_test
+
+tree_test %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+
+
+  # -- ROC Charts 
+tree_train %>%
+  mutate(model = "train") %>%
+  bind_rows(tree_test %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(event_label, .pred_1) %>%
+  autoplot()
+
+
+# -- Confusion Matrices
+tree_train %>%
+  conf_mat(event_label, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title="Tree Train Confusion Matrix")
+
+tree_test %>%
+  conf_mat(event_label, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title="Tree Test Confusion Matrix")
+```
+
+## random forest
+
+```{r}
+forest_spec <- rand_forest(trees = 500, min_n = 2) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", num.threads = 10, importance = "impurity")
+
+forest_wf <- workflow() %>%
+  add_recipe(fraud_recipe) %>%
+  add_model(forest_spec) %>%
+  fit(train)
+
+forest_wf %>% 
+  pull_workflow_fit() %>%
+  vip()
+
+options(yardstick.event_first = FALSE)
+
+predict(forest_wf, train, type="prob") %>%
+  bind_cols(predict(forest_wf, train, type="class")) %>%
+  bind_cols(train) -> forest_train
+
+forest_train %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+
+predict(forest_wf, test, type="prob") %>%
+  bind_cols(predict(forest_wf, test, type="class")) %>%
+  bind_cols(test) -> forest_test 
+
+forest_test %>%
+  metrics(event_label, estimate = .pred_class, .pred_1)
+
+# -- ROC Charts 
+forest_train %>%
+  mutate(model = "train") %>%
+  bind_rows(forest_test %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(event_label, .pred_1) %>%
+  autoplot()
+
+
+# -- Confusion Matrices
+forest_train %>%
+  conf_mat(event_label, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title="Random Forest Train Confusion Matrix")
+
+forest_test %>%
+  conf_mat(event_label, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title="Random Forest Test Confusion Matrix")
+
+
+```
+
+# Precision and Recall 
+```{r}
+bind_rows(logistic_train %>%
+  mutate(model = "Logistic Regression"),
+tree_train %>%
+  mutate(model = "Decision Tree"),
+forest_train %>%
+  mutate(model = "Random Forest")) %>% 
+  group_by(model) %>%
+   mutate(predict_class = as.factor(if_else(.pred_1 >=0.06,1,0))) %>%
+  precision(event_label, estimate = predict_class) 
+```
+
+
+## Score Distribution
+
+```{r}
+logistic_test %>%
+  ggplot(aes(.pred_1, fill=event_label)) +
+  geom_histogram(bins=50) +
+  xlim(0, 1) +
+  ylim(0, 6000) +
+  geom_vline(aes(xintercept=0.5)) +
+  labs(title="Logistic Regression score distribution")
+
+tree_test %>%
+  ggplot(aes(.pred_1, fill=event_label)) +
+  geom_histogram(bins=50) +
+  xlim(0, 1) +
+  ylim(0, 6000) +
+  geom_vline(aes(xintercept=0.5)) +
+  labs(title="Decision Tree score distribution")
+
+forest_test %>%
+  ggplot(aes(.pred_1, fill=event_label)) +
+  geom_histogram(bins=50) +
+  xlim(0, 1) +
+  ylim(0, 6000) +
+  geom_vline(aes(xintercept=0.5)) +
+  labs(title="Random Forest score distribution")
+```
+# Predict 
+```{r,warning=FALSE,message=FALSE}
+kaggle <- read.csv("project_2_holdout.csv") %>% clean_names()
+
+kaggle_prep <- kaggle %>%
+  select(-ip_address, -user_agent, -phone_number, # -billing_city, -email_domain,
+         -event_timestamp, -applicant_name, -billing_address, -merchant_id, 
+         -event_id, -locale) %>%
+  mutate(event_label = 1)
+
+kaggle_prep <- kaggle_prep %>% 
+  left_join(city_freq_count) %>% 
+  select(-billing_city)
+
+kaggle_prep <- kaggle_prep %>% 
+  left_join(domain_fraud_rate) %>% 
+  select(-email_domain)
+
+
+kaggle_prep <- kaggle_prep %>%
+  mutate(event_label = as_factor(event_label)) %>%
+  mutate_if(is.character, as_factor)
+
+options(yardstick.event_first = FALSE)
+
+kaggle1 <- predict(forest_wf, kaggle_prep, type="prob") %>%
+  bind_cols(predict(forest_wf, kaggle_prep, type="class")) %>%
+  mutate(event_label1 = .pred_1) %>%
+  select(event_label1)
+ 
+kaggle2 <- predict(forest_wf, kaggle_prep, type="prob") %>%
+  bind_cols(predict(forest_wf, kaggle_prep, type="class")) %>%
+  mutate(event_label2 = .pred_1) %>%
+  select(event_label2)
+
+kaggle3 <- predict(forest_wf, kaggle_prep, type="prob") %>%
+  bind_cols(predict(forest_wf, kaggle_prep, type="class")) %>%
+  mutate(event_label3 = .pred_1) %>%
+  select(event_label3)
+
+kaggle_final <- kaggle1 %>%
+  mutate(event_label = kaggle3$event_label3) %>%
+  select(event_label)
+
+event_id <- kaggle %>%
+  select(event_id)
+
+r <- bind_cols(event_id, kaggle_final)
+
+write.csv(r, "kaggle_prediction.csv", row.names = F)
+```
+```
+
+
+
